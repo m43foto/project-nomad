@@ -44,7 +44,7 @@ export class ZIMExtractionService {
     async extractZIMContent(
         filePath: string,
         opts: ExtractZIMContentOptions = {}
-    ): Promise<{ chunks: ZIMContentChunk[]; totalArticles: number; articlesProcessed: number }> {
+    ): Promise<{ chunks: ZIMContentChunk[]; totalArticles: number; articlesProcessed: number; nextEntryIndex: number }> {
         try {
             logger.info(`[ZIMExtractionService]: Processing ZIM file at path: ${filePath}`)
             
@@ -78,9 +78,22 @@ export class ZIMExtractionService {
             const startOffset = opts.startOffset || 0
             const batchSize = opts.batchSize || (opts.maxArticles || Infinity)
 
-            for (const entry of archive.iterByPath()) {
+            // [fork: zim-entry-cursor] Jump directly to the cursor when the caller
+            // knows it; otherwise fall back to the legacy article-count skip (first
+            // batch of a resumed/legacy chain), and report the cursor either way.
+            const useCursor =
+                typeof opts.startEntryIndex === 'number' && opts.startEntryIndex >= 0
+            const baseIndex = useCursor ? opts.startEntryIndex! : 0
+            const range = useCursor
+                ? archive.iterByPath().offset(baseIndex, Math.max(0, archive.entryCount - baseIndex))
+                : archive.iterByPath()
+            let entryIndex = baseIndex - 1
+            let nextEntryIndex = archive.entryCount
+
+            for (const entry of range) {
+                entryIndex++
                 // Skip articles until we reach the start offset
-                if (articlesSkipped < startOffset) {
+                if (!useCursor && articlesSkipped < startOffset) {
                     if (this.isArticleEntry(entry) && !processedPaths.has(entry.path)) {
                         articlesSkipped++
                     }
@@ -88,6 +101,7 @@ export class ZIMExtractionService {
                 }
 
                 if (articlesProcessed >= batchSize) {
+                    nextEntryIndex = entryIndex
                     break
                 }
 
@@ -165,7 +179,7 @@ export class ZIMExtractionService {
                 textPreview: c.text.substring(0, 100)
             })))
             logger.debug("Total structured sections extracted:", toReturn.length)
-            return { chunks: toReturn, totalArticles: archive.articleCount, articlesProcessed }
+            return { chunks: toReturn, totalArticles: archive.articleCount, articlesProcessed, nextEntryIndex }
         } catch (error) {
             logger.error('Error processing ZIM file:', error)
             throw error

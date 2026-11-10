@@ -24,6 +24,9 @@ export interface EmbedFileJobParams {
   // batch's chunk count was stored while Qdrant held the full set).
   chunksSoFar?: number
   collection?: string
+  // [fork: zim-entry-cursor] Raw entry index where this batch starts, so the
+  // extractor can seek instead of re-walking the archive from entry 0.
+  entryCursor?: number
 }
 
 export class EmbedFileJob {
@@ -147,7 +150,8 @@ export class EmbedFileJob {
         allowDeletion,
         batchOffset,
         onProgress,
-        effectiveCollection
+        effectiveCollection,
+        job.data.entryCursor
       )
 
       if (!result.success) {
@@ -201,6 +205,7 @@ export class EmbedFileJob {
           totalArticles: totalArticles || result.totalArticles,
           isFinalBatch: false, // Explicitly not final
           chunksSoFar: chunksSoFarNext,
+          ...(typeof result.nextEntryIndex === 'number' ? { entryCursor: result.nextEntryIndex } : {}),
           // Carry the collection across batches, otherwise only batch 1 of a ZIM
           // would be tagged and the rest would land uncategorized.
           ...(effectiveCollection ? { collection: effectiveCollection } : {}),
@@ -598,6 +603,7 @@ export class EmbedFileJob {
         totalArticles: data.totalArticles,
         isFinalBatch: false,
         chunksSoFar: data.chunksSoFar ?? 0,
+        ...(typeof data.entryCursor === 'number' ? { entryCursor: data.entryCursor } : {}),
         ...(effectiveCollection ? { collection: effectiveCollection } : {}),
       },
       // Offset 0 would reuse the deterministic jobId, which may still be held

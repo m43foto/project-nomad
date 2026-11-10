@@ -93,6 +93,11 @@ export type ExtractZIMContentOptions = {
   // Batch processing options to avoid lock timeouts
   startOffset?: number // Article index to start from for resuming
   batchSize?: number // Max articles to process in this batch
+  // [fork: zim-entry-cursor] Raw path-order entry index of the first entry of
+  // this batch. When set, iteration jumps straight there (O(1)) instead of
+  // re-walking every entry from 0 to count startOffset articles (O(offset),
+  // ~23 s at article 86k and ~50 min near the end of a 27M-entry archive on HDD).
+  startEntryIndex?: number
 }
 
 export type ExtractZIMChunkingStrategy = 'structured' | 'simple'

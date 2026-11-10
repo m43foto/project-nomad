@@ -38,6 +38,8 @@ export type ProcessAndEmbedFileResponse = {
   hasMoreBatches?: boolean
   articlesProcessed?: number
   totalArticles?: number
+  /** [fork: zim-entry-cursor] Entry index where the next ZIM batch starts. */
+  nextEntryIndex?: number
 }
 export type ProcessZIMFileResponse = ProcessAndEmbedFileResponse
 

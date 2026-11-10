@@ -608,7 +608,8 @@ export class RagService {
     deleteAfterEmbedding: boolean,
     batchOffset?: number,
     onProgress?: (percent: number) => Promise<void>,
-    collection?: string
+    collection?: string,
+    startEntryIndex?: number
   ): Promise<ProcessZIMFileResponse> {
     const zimExtractionService = new ZIMExtractionService()
 
@@ -623,9 +624,11 @@ export class RagService {
       chunks: zimChunks,
       totalArticles,
       articlesProcessed,
+      nextEntryIndex,
     } = await zimExtractionService.extractZIMContent(filepath, {
       startOffset,
       batchSize: ZIM_BATCH_SIZE,
+      startEntryIndex,
     })
 
     logger.info(
@@ -717,6 +720,7 @@ export class RagService {
       // zero and re-run the same window forever.
       articlesProcessed,
       totalArticles,
+      nextEntryIndex,
     }
   }
 
@@ -865,7 +869,8 @@ export class RagService {
     deleteAfterEmbedding: boolean = false,
     batchOffset?: number,
     onProgress?: (percent: number) => Promise<void>,
-    collection?: string
+    collection?: string,
+    startEntryIndex?: number
   ): Promise<ProcessAndEmbedFileResponse> {
     try {
       const fileType = determineFileType(filepath)
@@ -884,7 +889,7 @@ export class RagService {
       // Process based on file type
       // ZIM files are handled specially since they have their own embedding workflow
       if (fileType === 'zim') {
-        return await this.processZIMFile(filepath, deleteAfterEmbedding, batchOffset, onProgress, collection)
+        return await this.processZIMFile(filepath, deleteAfterEmbedding, batchOffset, onProgress, collection, startEntryIndex)
       }
 
       // Extract text based on file type
