@@ -16,6 +16,21 @@ export type EmbedJobWithProgress = {
   chunks?: number
 }
 
+/** [fork: resume-indexing] A ZIM ingestion whose batch chain broke (stall,
+ *  crash, restart) and can be continued from its last batch offset. */
+export type ResumableEmbedJob = {
+  jobId: string
+  fileName: string
+  filePath: string
+  batchOffset: number
+  totalArticles?: number
+  chunksSoFar: number
+  /** 0-100 (2 decimals), position of batchOffset within the archive. */
+  progress: number
+  failedReason?: string
+  failedAt?: number
+}
+
 export type ProcessAndEmbedFileResponse = {
   success: boolean
   message: string

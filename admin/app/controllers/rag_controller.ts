@@ -7,7 +7,7 @@ import app from '@adonisjs/core/services/app'
 import { randomBytes } from 'node:crypto'
 import { sanitizeFilename } from '../utils/fs.js'
 import { basename } from 'node:path'
-import { deleteFileSchema, embedFileSchema, estimateBatchSchema, fileSourceSchema, getJobStatusSchema } from '#validators/rag'
+import { deleteFileSchema, embedFileSchema, estimateBatchSchema, fileSourceSchema, getJobStatusSchema, resumeJobSchema } from '#validators/rag'
 import logger from '@adonisjs/core/services/logger'
 import { sanitizeCollectionName } from '../../constants/kb_collections.js'
 
@@ -222,6 +222,39 @@ export default class RagController {
       message: `Cancelled ${result.cancelled} job${result.cancelled !== 1 ? 's' : ''}${result.filesDeleted > 0 ? `, deleted ${result.filesDeleted} file${result.filesDeleted !== 1 ? 's' : ''}` : ''}.`,
       ...result,
     })
+  }
+
+  // [fork: resume-indexing]
+  public async getResumableJobs({ response }: HttpContext) {
+    const jobs = await EmbedFileJob.listResumableJobs()
+    return response.status(200).json(jobs)
+  }
+
+  // [fork: resume-indexing]
+  public async resumeJob({ request, response }: HttpContext) {
+    const { filePath } = await request.validateUsing(resumeJobSchema)
+    try {
+      const result = await EmbedFileJob.resumeJob(filePath)
+      if (!result.ok) return response.status(404).json({ error: result.message, code: result.code })
+      return response.status(202).json(result)
+    } catch (error) {
+      logger.error({ err: error }, '[RagController] Error resuming embedding job')
+      return response.status(500).json({ error: 'Error resuming indexing job' })
+    }
+  }
+
+  // [fork: resume-indexing]
+  public async resumeAllJobs({ response }: HttpContext) {
+    try {
+      const result = await EmbedFileJob.resumeAllJobs()
+      return response.status(202).json({
+        message: `Resumed ${result.resumed} indexing job${result.resumed !== 1 ? 's' : ''}.`,
+        ...result,
+      })
+    } catch (error) {
+      logger.error({ err: error }, '[RagController] Error resuming embedding jobs')
+      return response.status(500).json({ error: 'Error resuming indexing jobs' })
+    }
   }
 
   public async policyPromptState({ response }: HttpContext) {

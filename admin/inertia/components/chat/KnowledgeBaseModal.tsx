@@ -29,6 +29,7 @@ import {
 import { useModals } from '~/context/ModalContext'
 import StyledModal from '../StyledModal'
 import ActiveEmbedJobs from '~/components/ActiveEmbedJobs'
+import ResumableEmbedJobs from '~/components/ResumableEmbedJobs'
 import { SERVICE_NAMES } from '../../../constants/service_names'
 import CollectionsManager from './CollectionsManager'
 import { KB_COLLECTIONS } from '../../../constants/kb_collections'
@@ -389,6 +390,7 @@ export default function KnowledgeBaseModal({
       })
       queryClient.invalidateQueries({ queryKey: ['embed-jobs'] })
       queryClient.invalidateQueries({ queryKey: ['failedEmbedJobs'] })
+      queryClient.invalidateQueries({ queryKey: ['resumableEmbedJobs'] })
       queryClient.invalidateQueries({ queryKey: ['storedFiles'] })
       queryClient.invalidateQueries({ queryKey: ['kbFileWarnings'] })
     },
@@ -745,6 +747,7 @@ export default function KnowledgeBaseModal({
                 </StyledButton>
               </div>
             </div>
+            <ResumableEmbedJobs disabled={qdrantOffline} />
             <ActiveEmbedJobs withHeader={false} />
           </div>
 

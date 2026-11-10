@@ -9,7 +9,7 @@ import { FileEntry } from '../../types/files'
 import { AppAutoUpdateStatus, AutoUpdateStatus, CheckLatestVersionResult, ContentAutoUpdateStatus, SystemInformationResponse, SystemUpdateStatus } from '../../types/system'
 import { DownloadJobWithProgress, WikipediaState } from '../../types/downloads'
 import type { Country, CountryCode, CountryGroup, MapExtractPreflight } from '../../types/maps'
-import { EmbedJobWithProgress, FileWarningsResult, StoredFileInfo } from '../../types/rag'
+import { EmbedJobWithProgress, FileWarningsResult, ResumableEmbedJob, StoredFileInfo } from '../../types/rag'
 import type { CategoryWithStatus, CollectionWithStatus, ContentUpdateCheckResult, CreatorPackWithStatus, ResourceUpdateInfo } from '../../types/collections'
 import { catchInternal } from './util'
 import { NomadChatResponse, NomadInstalledModel, NomadOllamaModel, OllamaChatRequest } from '../../types/ollama'
@@ -547,6 +547,25 @@ class API {
   async cleanupFailedEmbedJobs(): Promise<{ message: string; cleaned: number; filesDeleted: number } | undefined> {
     return catchInternal(async () => {
       const response = await this.client.delete<{ message: string; cleaned: number; filesDeleted: number }>('/rag/failed-jobs')
+      return response.data
+    })()
+  }
+
+  // [fork: resume-indexing]
+  async getResumableEmbedJobs(): Promise<ResumableEmbedJob[] | undefined> {
+    return catchInternal(async () => {
+      const response = await this.client.get<ResumableEmbedJob[]>('/rag/resumable-jobs')
+      return response.data
+    })()
+  }
+
+  // [fork: resume-indexing]
+  async resumeEmbedJob(filePath: string) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ message: string; batchOffset: number; removedPoints: number }>(
+        '/rag/resumable-jobs/resume',
+        { filePath }
+      )
       return response.data
     })()
   }

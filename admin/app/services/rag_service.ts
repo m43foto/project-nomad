@@ -2329,6 +2329,32 @@ export class RagService {
   }
 
   /**
+   * [fork: resume-indexing] Remove the points a crashed/stalled batch wrote for
+   * `source` at or after `sinceMs`. Point IDs are random UUIDs, so re-running a
+   * partially written batch would otherwise duplicate its chunks. Only the
+   * batch that was in flight for this source can have written points after its
+   * own start time, so the range filter isolates exactly that partial batch.
+   * Returns the number of points removed.
+   */
+  public async deletePointsForSourceSince(source: string, sinceMs: number): Promise<number> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+    const filter = {
+      must: [
+        { key: 'source', match: { value: this.sanitizeText(source) } },
+        { key: 'created_at', range: { gte: sinceMs } },
+      ],
+    }
+    const { count } = await this.qdrant!.count(RagService.CONTENT_COLLECTION_NAME, {
+      filter,
+      exact: true,
+    })
+    if (count > 0) {
+      await this.qdrant!.delete(RagService.CONTENT_COLLECTION_NAME, { wait: true, filter })
+    }
+    return count
+  }
+
+  /**
    * Same as _deletePointsBySource(), but for many sources in one round trip
    * via Qdrant's `match.any` filter — used by the orphan sweep below, where
    * purging one-by-one would mean a separate delete call (plus a separate

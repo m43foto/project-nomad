@@ -25,6 +25,13 @@ export const fileSourceSchema = vine.compile(
   })
 )
 
+// [fork: resume-indexing]
+export const resumeJobSchema = vine.compile(
+  vine.object({
+    filePath: vine.string().minLength(1),
+  })
+)
+
 export const estimateBatchSchema = vine.compile(
   vine.object({
     files: vine

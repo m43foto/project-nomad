@@ -53,6 +53,7 @@ import {
   embedFileSchema,
   fileSourceSchema,
   estimateBatchSchema,
+  resumeJobSchema,
 } from '#validators/rag'
 import {
   installServiceValidator,
@@ -464,6 +465,20 @@ router
     })
     documented(router.delete('/jobs', [RagController, 'cancelAllJobs']), {
       summary: 'Cancel all RAG jobs',
+      tags: ['rag'],
+    })
+    // [fork: resume-indexing]
+    documented(router.get('/resumable-jobs', [RagController, 'getResumableJobs']), {
+      summary: 'List interrupted ZIM indexing jobs that can be resumed',
+      tags: ['rag'],
+    })
+    documented(router.post('/resumable-jobs/resume', [RagController, 'resumeJob']), {
+      summary: 'Resume an interrupted ZIM indexing job at its last batch offset',
+      tags: ['rag'],
+      request: resumeJobSchema,
+    })
+    documented(router.post('/resumable-jobs/resume-all', [RagController, 'resumeAllJobs']), {
+      summary: 'Resume all interrupted ZIM indexing jobs',
       tags: ['rag'],
     })
     documented(router.get('/job-status', [RagController, 'getJobStatus']), {

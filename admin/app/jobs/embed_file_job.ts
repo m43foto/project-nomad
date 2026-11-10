@@ -1,6 +1,6 @@
 import { Job, UnrecoverableError } from 'bullmq'
 import { QueueService } from '#services/queue_service'
-import { EmbedJobWithProgress } from '../../types/rag.js'
+import { EmbedJobWithProgress, ResumableEmbedJob } from '../../types/rag.js'
 import { RagService } from '#services/rag_service'
 import { DockerService } from '#services/docker_service'
 import { OllamaService } from '#services/ollama_service'
@@ -471,6 +471,171 @@ export class EmbedFileJob {
         status: 'failed',
         error: (job.data as any).error,
       }))
+  }
+
+  // ---------------------------------------------------------------------------
+  // [fork: resume-indexing]
+  //
+  // A multi-batch ZIM ingestion is a chain of continuation jobs: each batch
+  // dispatches the next one. The embed queue runs with maxStalledCount: 0, so
+  // when the admin container restarts (or the host sleeps) mid-batch, BullMQ
+  // fails the in-flight batch with "job stalled more than allowable limit".
+  // handle() never sees that failure, so job.data.status stays 'processing',
+  // the job is invisible to listFailedJobs(), and the chain is simply gone. The
+  // only built-in recovery is re-indexing the whole file from offset 0.
+  //
+  // The helpers below find those broken chains and continue them from the
+  // failed batch's offset, after removing whatever partial output that batch
+  // had already written to Qdrant (point IDs are random, so a rerun would
+  // otherwise duplicate it).
+  // ---------------------------------------------------------------------------
+
+  /** Most recent terminally failed batch per ZIM file that can be continued. */
+  private static async findResumeCandidates(): Promise<Map<string, Job>> {
+    const queue = QueueService.getInstance().getQueue(this.queue)
+    const [failed, inFlight, completed] = await Promise.all([
+      queue.getJobs(['failed']),
+      queue.getJobs(['waiting', 'active', 'delayed', 'paused', 'prioritized']),
+      queue.getJobs(['completed']),
+    ])
+
+    const busy = new Set(inFlight.map((j) => (j.data as EmbedFileJobParams).filePath))
+
+    const latest = new Map<string, Job>()
+    for (const job of failed) {
+      const data = job.data as EmbedFileJobParams
+      if (!data?.filePath || !data.filePath.toLowerCase().endsWith('.zim')) continue
+      if (busy.has(data.filePath)) continue
+      const prev = latest.get(data.filePath)
+      if (!prev || job.timestamp > prev.timestamp) {
+        latest.set(data.filePath, job)
+      }
+    }
+
+    for (const [filePath, job] of latest) {
+      const startedAt = job.timestamp
+      // A batch for this file that was CREATED after the failed one has since
+      // completed: the chain was restarted some other way, so this failure is
+      // history, not a gap. (Compare creation times, not finishedOn — the parent
+      // batch finishes a few ms after dispatching the failed continuation.)
+      const supersededByCompleted = completed.some(
+        (c) =>
+          (c.data as EmbedFileJobParams).filePath === filePath && c.timestamp > startedAt
+      )
+      // The file finished indexing after the failure (e.g. re-embedded).
+      const state = await KbIngestState.findBy('file_path', filePath)
+      const indexedAfter =
+        state?.state === 'indexed' &&
+        !!state.updated_at &&
+        state.updated_at.toMillis() > startedAt
+      let exists = true
+      try {
+        await fs.access(filePath)
+      } catch {
+        exists = false
+      }
+      if (supersededByCompleted || indexedAfter || !exists) latest.delete(filePath)
+    }
+    return latest
+  }
+
+  static async listResumableJobs(): Promise<ResumableEmbedJob[]> {
+    const candidates = await this.findResumeCandidates()
+    return [...candidates.values()].map((job) => {
+      const data = job.data as EmbedFileJobParams
+      const batchOffset = data.batchOffset ?? 0
+      return {
+        jobId: job.id!.toString(),
+        fileName: data.fileName,
+        filePath: data.filePath,
+        batchOffset,
+        totalArticles: data.totalArticles,
+        chunksSoFar: data.chunksSoFar ?? 0,
+        progress:
+          data.totalArticles && data.totalArticles > 0
+            ? Math.min(99, Math.round((batchOffset / data.totalArticles) * 10000) / 100)
+            : 0,
+        failedReason: job.failedReason,
+        failedAt: job.finishedOn,
+      }
+    })
+  }
+
+  /** Continue a broken ZIM ingestion chain from its last failed batch. The
+   *  candidate is re-derived server-side from the file path, so a stale UI can
+   *  never resume an outdated batch (and wipe newer vectors). */
+  static async resumeJob(filePath: string): Promise<
+    | { ok: true; message: string; batchOffset: number; removedPoints: number }
+    | { ok: false; code: 'not_found'; message: string }
+  > {
+    const candidates = await this.findResumeCandidates()
+    const job = candidates.get(filePath)
+    if (!job) {
+      return {
+        ok: false,
+        code: 'not_found',
+        message: 'No resumable indexing job found for this file.',
+      }
+    }
+    const data = job.data as EmbedFileJobParams
+    const batchOffset = data.batchOffset ?? 0
+    // job.timestamp (creation) is the safe lower bound: the previous batch had
+    // written all of its points before dispatching this one. processedOn is NOT
+    // safe — BullMQ rewrites it when it detects the stall after a restart.
+    const sinceMs = job.timestamp
+
+    const ragService = new RagService(new DockerService(), new OllamaService())
+    const removedPoints = await ragService.deletePointsForSourceSince(filePath, sinceMs)
+
+    const effectiveCollection =
+      data.collection ?? (await KbIngestState.findBy('file_path', filePath))?.collection ?? undefined
+
+    const result = await EmbedFileJob.dispatch(
+      {
+        filePath,
+        fileName: data.fileName,
+        batchOffset,
+        totalArticles: data.totalArticles,
+        isFinalBatch: false,
+        chunksSoFar: data.chunksSoFar ?? 0,
+        ...(effectiveCollection ? { collection: effectiveCollection } : {}),
+      },
+      // Offset 0 would reuse the deterministic jobId, which may still be held
+      // by a retained terminal record; force a fresh id instead.
+      batchOffset > 0 ? undefined : { force: true }
+    )
+
+    // Drop every terminal failure for this file so it doesn't resurface.
+    const queue = QueueService.getInstance().getQueue(this.queue)
+    for (const failed of await queue.getJobs(['failed'])) {
+      if ((failed.data as EmbedFileJobParams).filePath !== filePath) continue
+      if (failed.id === result.jobId) continue
+      try {
+        await failed.remove()
+      } catch {
+        // already gone
+      }
+    }
+
+    logger.info(
+      `[EmbedFileJob] Resumed ${data.fileName} at offset ${batchOffset} (removed ${removedPoints} partial points)`
+    )
+    return {
+      ok: true,
+      message: `Indexing of ${data.fileName} resumed at article ${batchOffset.toLocaleString('en-US')}.`,
+      batchOffset,
+      removedPoints,
+    }
+  }
+
+  static async resumeAllJobs(): Promise<{ resumed: number; files: string[] }> {
+    const candidates = await this.findResumeCandidates()
+    const files: string[] = []
+    for (const filePath of candidates.keys()) {
+      const r = await this.resumeJob(filePath)
+      if (r.ok) files.push(filePath)
+    }
+    return { resumed: files.length, files }
   }
 
   static async cleanupFailedJobs(): Promise<{ cleaned: number; filesDeleted: number }> {
