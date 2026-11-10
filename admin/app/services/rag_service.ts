@@ -403,6 +403,33 @@ export class RagService {
   private sharedChunker: ReturnType<typeof TokenChunker.create> | null = null
 
   /**
+   * [fork: parallel-extraction] Retry a Qdrant write that died on the transport.
+   *
+   * With extraction overlapping the embedding phase a ZIM batch now takes ~5 s,
+   * which is Qdrant's HTTP keep-alive timeout: every few batches the upsert goes
+   * out on a pooled connection the server is closing at that very moment and
+   * undici reports `TypeError: fetch failed`. Without a retry the whole batch
+   * fails and sits out the job's 60 s backoff. The write is idempotent (point
+   * ids are generated before the call), so sending it again is safe.
+   */
+  private async _retryOnNetworkError<T>(what: string, fn: () => Promise<T>): Promise<T> {
+    const delays = [100, 500, 2000]
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn()
+      } catch (err) {
+        const isTransport = err instanceof TypeError && /fetch failed/i.test(err.message)
+        if (!isTransport || attempt >= delays.length) throw err
+        const cause = (err as { cause?: { code?: string; message?: string } }).cause
+        logger.warn(
+          `[RAG] Qdrant ${what} failed on the connection (${cause?.code ?? cause?.message ?? err.message}), retry ${attempt + 1}/${delays.length}`
+        )
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]))
+      }
+    }
+  }
+
+  /**
    * [fork: batched-embedding] Embed and store many documents at once.
    *
    * embedAndStoreText() handles one document per call: one /api/embed request
@@ -530,10 +557,10 @@ export class RagService {
     }
 
     for (let i = 0; i < points.length; i += 256) {
-      await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, {
-        wait: true,
-        points: points.slice(i, i + 256),
-      })
+      const slice = points.slice(i, i + 256)
+      await this._retryOnNetworkError('upsert', () =>
+        this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { wait: true, points: slice })
+      )
     }
 
     // Same toggle race closure as embedAndStoreText.
@@ -824,16 +851,33 @@ export class RagService {
       `[RAG] Extracting ZIM content (batch: offset=${startOffset}, size=${ZIM_BATCH_SIZE})`
     )
 
+    // [fork: parallel-extraction] Use the batch the previous job extracted ahead
+    // of time while it was embedding, if there is one for exactly this cursor.
+    const prefetched = await ZIMExtractionService.takePrefetched(
+      filepath,
+      startEntryIndex,
+      ZIM_BATCH_SIZE
+    )
+    if (prefetched) {
+      logger.info(`[RAG] Using prefetched ZIM batch (entry cursor ${startEntryIndex})`)
+    }
+
     const {
       chunks: zimChunks,
       totalArticles,
       articlesProcessed,
       nextEntryIndex,
-    } = await zimExtractionService.extractZIMContent(filepath, {
+    } = prefetched ??
+    (await zimExtractionService.extractZIMContent(filepath, {
       startOffset,
       batchSize: ZIM_BATCH_SIZE,
       startEntryIndex,
-    })
+    }))
+
+    // Extract the following batch while this one is being embedded.
+    if (hasMoreArticleBatches({ articlesProcessed, batchSize: ZIM_BATCH_SIZE })) {
+      ZIMExtractionService.prefetchBatch(filepath, nextEntryIndex, ZIM_BATCH_SIZE)
+    }
 
     logger.info(
       `[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata (file totalArticles=${totalArticles})`
@@ -900,6 +944,7 @@ export class RagService {
     // 2. No more batches remain (this is the final batch)
     // This prevents race conditions where early batches complete after later ones
     const shouldDelete = deleteAfterEmbedding && !hasMoreBatches
+    if (!hasMoreBatches) ZIMExtractionService.releaseFile(filepath)
     if (shouldDelete) {
       logger.info(`[RAG] Final batch complete, deleting ZIM file: ${filepath}`)
       await deleteFileIfExists(filepath)
@@ -1128,7 +1173,10 @@ export class RagService {
         collection
       )
     } catch (error) {
-      logger.error('[RAG] Error processing and embedding file:', error)
+      // The logger drops a bare Error passed as an argument; spell it out.
+      logger.error(
+        `[RAG] Error processing and embedding file: ${error instanceof Error ? error.stack || error.message : String(error)}`
+      )
       return { success: false, message: 'Error processing and embedding file.' }
     }
   }

@@ -1,14 +1,90 @@
 import { Archive, Entry } from '@openzim/libzim'
-import * as cheerio from 'cheerio'
-import { HTML_SELECTORS_TO_REMOVE, NON_CONTENT_HEADING_PATTERNS } from '../../constants/zim_extraction.js'
-import { extractStructuredContent } from '../utils/zim_html.js'
+import { ZIM_PREFETCH_NEXT_BATCH } from '../../constants/zim_extraction.js'
+import { buildArticleChunks, type ZIMArticleRef } from '../utils/zim_article.js'
+import { closeExtractPool, extractArticlesInParallel, isParallelExtractionAvailable } from './zim_extract_pool.js'
 import logger from '@adonisjs/core/services/logger'
-import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata } from '../../types/zim.js'
-import { randomUUID } from 'node:crypto'
+import { ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata } from '../../types/zim.js'
 import { access } from 'node:fs/promises'
 import { isValidZimFile } from '../utils/fs.js'
 
+export type ExtractZIMContentResult = {
+    chunks: ZIMContentChunk[]
+    totalArticles: number
+    articlesProcessed: number
+    nextEntryIndex: number
+}
+
 export class ZIMExtractionService {
+    /** Below this many articles a batch is not worth the round trip to the pool. */
+    private static MIN_PARALLEL_ARTICLES = 8
+
+    // [fork: parallel-extraction] Batches extracted ahead of time, keyed by
+    // file + entry cursor + batch size. At most one per file; an entry nobody
+    // collects (cancelled or failed chain) is dropped after PREFETCH_TTL_MS.
+    private static PREFETCH_TTL_MS = 10 * 60_000
+    private static prefetched = new Map<
+        string,
+        { filePath: string; result: Promise<ExtractZIMContentResult | null>; timer: NodeJS.Timeout }
+    >()
+
+    private static prefetchKey(filePath: string, startEntryIndex: number, batchSize: number) {
+        return `${filePath}|${startEntryIndex}|${batchSize}`
+    }
+
+    /**
+     * Start extracting the batch at `startEntryIndex` in the background so it is
+     * (mostly) ready when the continuation job asks for it. Extraction is disk-
+     * and CPU-bound, embedding GPU-bound, so the two overlap almost for free.
+     */
+    static prefetchBatch(filePath: string, startEntryIndex: number, batchSize: number): void {
+        if (!ZIM_PREFETCH_NEXT_BATCH || !isParallelExtractionAvailable()) return
+        const key = this.prefetchKey(filePath, startEntryIndex, batchSize)
+        if (this.prefetched.has(key)) return
+        this.discardPrefetched(filePath)
+
+        const result = new ZIMExtractionService()
+            .extractZIMContent(filePath, { startEntryIndex, batchSize })
+            .catch((error) => {
+                logger.warn(
+                    `[ZIMExtractionService]: Prefetch at entry ${startEntryIndex} failed: ${error instanceof Error ? error.message : String(error)}`
+                )
+                return null
+            })
+        const timer = setTimeout(() => this.prefetched.delete(key), this.PREFETCH_TTL_MS)
+        timer.unref()
+        this.prefetched.set(key, { filePath, result, timer })
+    }
+
+    /** Hand over (and forget) the prefetched batch for this cursor, if there is one. */
+    static async takePrefetched(
+        filePath: string,
+        startEntryIndex: number | undefined,
+        batchSize: number
+    ): Promise<ExtractZIMContentResult | null> {
+        if (typeof startEntryIndex !== 'number') return null
+        const key = this.prefetchKey(filePath, startEntryIndex, batchSize)
+        const hit = this.prefetched.get(key)
+        if (!hit) return null
+        clearTimeout(hit.timer)
+        this.prefetched.delete(key)
+        return hit.result
+    }
+
+    /** Drop any prefetched batch of this file. */
+    static discardPrefetched(filePath: string): void {
+        for (const [key, entry] of this.prefetched) {
+            if (entry.filePath === filePath) {
+                clearTimeout(entry.timer)
+                this.prefetched.delete(key)
+            }
+        }
+    }
+
+    /** Release prefetched data and the worker pool's handles on this file. */
+    static releaseFile(filePath: string): void {
+        this.discardPrefetched(filePath)
+        closeExtractPool(filePath)
+    }
 
     private extractArchiveMetadata(archive: Archive): ZIMArchiveMetadata {
         try {
@@ -44,7 +120,7 @@ export class ZIMExtractionService {
     async extractZIMContent(
         filePath: string,
         opts: ExtractZIMContentOptions = {}
-    ): Promise<{ chunks: ZIMContentChunk[]; totalArticles: number; articlesProcessed: number; nextEntryIndex: number }> {
+    ): Promise<ExtractZIMContentResult> {
         try {
             logger.info(`[ZIMExtractionService]: Processing ZIM file at path: ${filePath}`)
             
@@ -69,10 +145,13 @@ export class ZIMExtractionService {
             const archiveMetadata = this.extractArchiveMetadata(archive)
             logger.info(`[ZIMExtractionService]: Archive metadata - Title: ${archiveMetadata.title}, Language: ${archiveMetadata.language}`)
 
-            let articlesProcessed = 0
             let articlesSkipped = 0
             const processedPaths = new Set<string>()
-            const toReturn: ZIMContentChunk[] = []
+            // [fork: parallel-extraction] Phase 1 (the loop below) walks the dirents
+            // only and collects the article entries of this batch (~50-100 ms per
+            // 200 articles). The expensive part, reading + parsing each blob, is
+            // phase 2 and runs on the worker pool.
+            const articles: ZIMArticleRef[] = []
 
             // Support batch processing to avoid lock timeouts on large ZIM files
             const startOffset = opts.startOffset || 0
@@ -100,7 +179,7 @@ export class ZIMExtractionService {
                     continue
                 }
 
-                if (articlesProcessed >= batchSize) {
+                if (articles.length >= batchSize) {
                     nextEntryIndex = entryIndex
                     break
                 }
@@ -116,58 +195,39 @@ export class ZIMExtractionService {
                 }
                 processedPaths.add(entry.path)
 
-                const item = entry.item
-                const blob = item.data
-                const html = this.getCleanedHTMLString(blob.data)
+                articles.push({ index: entryIndex, path: entry.path, title: entry.title })
+            }
 
-                const strategy = opts.strategy || this.chooseChunkingStrategy(html);
-                logger.debug(`[ZIMExtractionService]: Chosen chunking strategy for path ${entry.path}: ${strategy}`)
-
-                // Generate a unique document ID. All chunks from same article will share it
-                const documentId = randomUUID()
-                const articleTitle = entry.title || entry.path
-
-                let chunks: ZIMContentChunk[]
-
-                if (strategy === 'structured') {
-                    const structured = extractStructuredContent(html)
-                    chunks = structured.sections.map(s => ({
-                        text: s.text,
-                        articleTitle,
-                        articlePath: entry.path,
-                        sectionTitle: s.heading,
-                        fullTitle: `${articleTitle} - ${s.heading}`,
-                        hierarchy: `${articleTitle} > ${s.heading}`,
-                        sectionLevel: s.level,
-                        documentId,
-                        archiveMetadata,
-                        strategy,
-                    }))
-                } else {
-                    // Simple strategy - entire article as one chunk
-                    const text = this.extractTextFromHTML(html) || ''
-                    chunks = [{
-                        text,
-                        articleTitle,
-                        articlePath: entry.path,
-                        sectionTitle: articleTitle, // Same as article for simple strategy
-                        fullTitle: articleTitle,
-                        hierarchy: articleTitle,
-                        documentId,
-                        archiveMetadata,
-                        strategy,
-                    }]
+            // Phase 2: read + parse the blobs, on the worker pool when available.
+            let perArticle: ZIMContentChunk[][] | null = null
+            if (
+                articles.length >= ZIMExtractionService.MIN_PARALLEL_ARTICLES &&
+                isParallelExtractionAvailable()
+            ) {
+                try {
+                    perArticle = await extractArticlesInParallel(filePath, articles, archiveMetadata, opts.strategy)
+                } catch (error) {
+                    logger.warn(
+                        `[ZIMExtractionService]: Parallel extraction failed, falling back to serial: ${error instanceof Error ? error.message : String(error)}`
+                    )
                 }
+            }
+            if (!perArticle) {
+                perArticle = articles.map((article) =>
+                    buildArticleChunks(
+                        archive.getEntryByPath(article.index).item.data.data,
+                        article,
+                        archiveMetadata,
+                        opts.strategy
+                    )
+                )
+            }
 
-                logger.debug(`Extracted ${chunks.length} chunks from article at path: ${entry.path} using strategy: ${strategy}`)
-
-                const nonEmptyChunks = chunks.filter(c => c.text.trim().length > 0)
-                logger.debug(`After filtering empty chunks, ${nonEmptyChunks.length} chunks remain for article at path: ${entry.path}`)
-                toReturn.push(...nonEmptyChunks)
-                articlesProcessed++
-
-                if (opts.onProgress) {
-                    opts.onProgress(articlesProcessed, archive.articleCount)
+            const toReturn: ZIMContentChunk[] = perArticle.flat()
+            const articlesProcessed = articles.length
+            if (opts.onProgress) {
+                for (let done = 1; done <= articlesProcessed; done++) {
+                    opts.onProgress(done, archive.articleCount)
                 }
             }
 
@@ -184,87 +244,6 @@ export class ZIMExtractionService {
             logger.error('Error processing ZIM file:', error)
             throw error
         }
-    }
-
-    private chooseChunkingStrategy(html: string, options = {
-        forceStrategy: null as ExtractZIMChunkingStrategy | null,
-    }): ExtractZIMChunkingStrategy {
-        const {
-            forceStrategy = null,
-        } = options;
-
-        if (forceStrategy) return forceStrategy;
-
-        // Use a simple analysis to determin if the HTML has any meaningful structure
-        // that we can leverage for better chunking. If not, we'll just chunk it as one big piece of text.
-        return this.hasStructuredHeadings(html) ? 'structured' : 'simple';
-    }
-
-    private getCleanedHTMLString(buff: Buffer<ArrayBufferLike>): string {
-        const rawString = buff.toString('utf-8');
-        const $ = cheerio.load(rawString);
-
-        HTML_SELECTORS_TO_REMOVE.forEach((selector) => {
-            $(selector).remove()
-        });
-
-        return $.html();
-    }
-
-    private extractTextFromHTML(html: string): string | null {
-        try {
-            const $ = cheerio.load(html)
-
-            // Search body first, then root if body is absent
-            const text = $('body').length ? $('body').text() : $.root().text()
-
-            return text.replace(/\s+/g, ' ').replace(/\n\s*\n/g, '\n').trim()
-        } catch (error) {
-            logger.error('Error extracting text from HTML:', error)
-            return null
-        }
-    }
-
-    private hasStructuredHeadings(html: string): boolean {
-        const $ = cheerio.load(html);
-
-        const headings = $('h2, h3').toArray();
-
-        // Consider it structured if it has at least 2 headings to break content into meaningful sections
-        if (headings.length < 2) return false;
-
-        // Check that headings have substantial content between them
-        let sectionsWithContent = 0;
-
-        for (const heading of headings) {
-            const $heading = $(heading);
-            const headingText = $heading.text().trim();
-
-            // Skip empty or very short headings, likely not meaningful
-            if (headingText.length < 3) continue;
-
-            // Skip common non-content headings
-            if (NON_CONTENT_HEADING_PATTERNS.some(pattern => pattern.test(headingText))) {
-                continue;
-            }
-
-            // Content until next heading
-            let contentLength = 0;
-            let $next = $heading.next();
-
-            while ($next.length && !$next.is('h1, h2, h3, h4')) {
-                contentLength += $next.text().trim().length;
-                $next = $next.next();
-            }
-
-            // Consider it a real section if it has at least 100 chars of content
-            if (contentLength >= 100) {
-                sectionsWithContent++;
-            }
-        }
-
-        // Require at least 2 sections with substantial content
-        return sectionsWithContent >= 2;
     }
 
     private isArticleEntry(entry: Entry): boolean {

@@ -54,6 +54,17 @@ export const ZIM_BATCH_SIZE = positiveIntEnv('NOMAD_ZIM_BATCH_SIZE', 50)
 export const ZIM_EMBED_REQUEST_SIZE = positiveIntEnv('NOMAD_EMBED_REQUEST_SIZE', 32)
 export const ZIM_EMBED_CONCURRENCY = positiveIntEnv('NOMAD_EMBED_CONCURRENCY', 4)
 
+// [fork: parallel-extraction] Worker threads that read + parse the articles of
+// a batch (1 = extract serially in the queue worker itself). Measured on the
+// Wikipedia maxi ZIM on an HDD RAID 1, 200 articles cold: serial 6.5-8 s,
+// 4 workers ~3.0 s, 8 ~2.2 s, 16 ~1.9 s, 32 ~1.8 s.
+export const ZIM_EXTRACT_WORKERS = positiveIntEnv('NOMAD_ZIM_EXTRACT_WORKERS', 8)
+
+// [fork: parallel-extraction] Extract the next batch while the current one is
+// being embedded, so disk/CPU extraction overlaps the GPU phase.
+export const ZIM_PREFETCH_NEXT_BATCH =
+    (typeof process !== 'undefined' ? process.env?.NOMAD_ZIM_PREFETCH : undefined) !== 'false'
+
 function positiveIntEnv(name: string, fallback: number): number {
     const raw = typeof process !== 'undefined' ? process.env?.[name] : undefined
     const n = raw ? Number.parseInt(raw, 10) : NaN
