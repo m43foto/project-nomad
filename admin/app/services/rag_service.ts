@@ -45,7 +45,7 @@ const EXCLUDE_EVAL_FILTER = {
 }
 import type { KbIngestStateValue } from '../../types/kb_ingest_state.js'
 import { ZIMExtractionService } from './zim_extraction_service.js'
-import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
+import { ZIM_BATCH_SIZE, ZIM_EMBED_CONCURRENCY, ZIM_EMBED_REQUEST_SIZE } from '../../constants/zim_extraction.js'
 import { hasMoreArticleBatches } from '../utils/zim_batch_decision.js'
 import { EMBEDDING_MODEL_NAME } from '../../constants/ollama.js'
 import {
@@ -346,6 +346,210 @@ export class RagService {
     return [...new Set(keywords)]
   }
 
+  /** Verify (once per instance) that the embedding model exists, pulling it if
+   *  needed. Returns false when it is unavailable. */
+  private async _ensureEmbeddingModel(): Promise<boolean> {
+    if (this.embeddingModelVerified) return true
+    const allModels = await this.ollamaService.getModels(true)
+    const embeddingModel =
+      allModels.find((model) => model.name === EMBEDDING_MODEL_NAME) ??
+      allModels.find((model) => model.name.toLowerCase().includes('nomic-embed-text'))
+
+    if (!embeddingModel) {
+      try {
+        const downloadResult = await this.ollamaService.downloadModel(EMBEDDING_MODEL_NAME)
+        if (!downloadResult.success) {
+          throw new Error(downloadResult.message || 'Unknown error during model download')
+        }
+      } catch (modelError) {
+        logger.error(
+          `[RAG] Embedding model ${EMBEDDING_MODEL_NAME} not found locally and failed to download:`,
+          modelError
+        )
+        this.embeddingModelVerified = false
+        return false
+      }
+    }
+    this.resolvedEmbeddingModel = embeddingModel?.name ?? EMBEDDING_MODEL_NAME
+    this.embeddingModelVerified = true
+    return true
+  }
+
+  /** Split text into embedding chunks and the prefixed/truncated model inputs. */
+  private async _prepareEmbeddingInputs(
+    text: string
+  ): Promise<{ chunks: string[]; inputs: string[] }> {
+    const targetCharsPerChunk = Math.floor(RagService.TARGET_TOKENS_PER_CHUNK * RagService.CHAR_TO_TOKEN_RATIO)
+    const overlapChars = Math.floor(RagService.CHUNK_OVERLAP_TOKENS * RagService.CHAR_TO_TOKEN_RATIO)
+    if (!this.sharedChunker) {
+      this.sharedChunker = TokenChunker.create({ chunkSize: targetCharsPerChunk, chunkOverlap: overlapChars })
+    }
+    const chunker = await this.sharedChunker
+    const chunkResults = await chunker.chunk(text)
+    const chunks = (chunkResults ?? []).map((c) => c.text)
+    const inputs = chunks.map((chunkText) => {
+      const prefixText = RagService.SEARCH_DOCUMENT_PREFIX
+      if (this.estimateTokenCount(prefixText + chunkText) > RagService.MAX_SAFE_TOKENS) {
+        chunkText = this.truncateToTokenLimit(
+          chunkText,
+          RagService.MAX_SAFE_TOKENS - this.estimateTokenCount(prefixText)
+        )
+      }
+      return prefixText + chunkText
+    })
+    return { chunks, inputs }
+  }
+
+  private sharedChunker: ReturnType<typeof TokenChunker.create> | null = null
+
+  /**
+   * [fork: batched-embedding] Embed and store many documents at once.
+   *
+   * embedAndStoreText() handles one document per call: one /api/embed request
+   * carrying the 1-2 chunks of a single ZIM section, one Qdrant upsert, two DB
+   * reads. For bulk ZIM ingestion that leaves the GPU idle most of the time
+   * (~21 chunks/s on an RTX 4090). Here all chunks of a ZIM batch are embedded
+   * in requests of ZIM_EMBED_REQUEST_SIZE inputs with ZIM_EMBED_CONCURRENCY in
+   * flight (~155 chunks/s measured), and written with a few bulk upserts.
+   *
+   * Error semantics match the per-document path: a document whose embedding
+   * fails is skipped. If a whole request fails, its documents are retried one
+   * by one; if every one of them fails, the embedding service itself is down,
+   * so we throw and let the job retry instead of silently skipping the batch.
+   */
+  public async embedAndStoreMany(
+    docs: { text: string; metadata: Record<string, any> }[],
+    onProgress?: (percent: number) => Promise<void>
+  ): Promise<{ chunks: number; skippedDocs: number }> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+    if (!(await this._ensureEmbeddingModel())) {
+      throw new Error(`Embedding model ${EMBEDDING_MODEL_NAME} is not available`)
+    }
+    const model = this.resolvedEmbeddingModel ?? EMBEDDING_MODEL_NAME
+
+    type Prepared = { doc: number; chunks: string[]; inputs: string[]; vectors?: number[][] }
+    const prepared: Prepared[] = []
+    for (let d = 0; d < docs.length; d++) {
+      const { chunks, inputs } = await this._prepareEmbeddingInputs(docs[d].text)
+      if (chunks.length > 0) prepared.push({ doc: d, chunks, inputs })
+    }
+    const skipped = new Set<number>()
+
+    // Pack whole documents into requests of ~ZIM_EMBED_REQUEST_SIZE inputs.
+    const requests: Prepared[][] = []
+    let current: Prepared[] = []
+    let size = 0
+    for (const p of prepared) {
+      if (size > 0 && size + p.inputs.length > ZIM_EMBED_REQUEST_SIZE) {
+        requests.push(current)
+        current = []
+        size = 0
+      }
+      current.push(p)
+      size += p.inputs.length
+    }
+    if (current.length) requests.push(current)
+
+    let done = 0
+    let nextReq = 0
+    const runRequest = async (group: Prepared[]) => {
+      try {
+        const res = await this.ollamaService.embed(model, group.flatMap((p) => p.inputs))
+        let k = 0
+        for (const p of group) {
+          p.vectors = res.embeddings.slice(k, k + p.inputs.length)
+          k += p.inputs.length
+        }
+      } catch (groupErr) {
+        logger.warn(
+          `[RAG] Batched embed of ${group.length} documents failed, retrying one by one: %s`,
+          groupErr instanceof Error ? groupErr.message : String(groupErr)
+        )
+        let ok = 0
+        let lastErr: unknown = groupErr
+        for (const p of group) {
+          try {
+            p.vectors = (await this.ollamaService.embed(model, p.inputs)).embeddings
+            ok++
+          } catch (err) {
+            lastErr = err
+            skipped.add(p.doc)
+            logger.error(`[RAG] Skipping document after embed failure:`, err)
+          }
+        }
+        if (ok === 0) throw lastErr
+      }
+      done += group.length
+      if (onProgress && prepared.length) await onProgress((done / prepared.length) * 100)
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(ZIM_EMBED_CONCURRENCY, requests.length) }, async () => {
+        while (nextReq < requests.length) await runRequest(requests[nextReq++])
+      })
+    )
+
+    // Build points. Every document of a ZIM batch shares one source, but stay
+    // general and resolve the active flag once per distinct source.
+    const timestamp = Date.now()
+    const activeBySource = new Map<string, boolean>()
+    const points: { id: string; vector: number[]; payload: Record<string, any> }[] = []
+    for (const p of prepared) {
+      if (!p.vectors || skipped.has(p.doc)) continue
+      const metadata = docs[p.doc].metadata
+      const sanitizedSource =
+        typeof metadata.source === 'string' ? this.sanitizeText(metadata.source) : 'unknown'
+      if (!activeBySource.has(sanitizedSource)) {
+        activeBySource.set(sanitizedSource, await this._readActiveFlag(sanitizedSource))
+      }
+      const active = activeBySource.get(sanitizedSource)!
+      let structuralKeywords: string[] = []
+      if (metadata.full_title) {
+        structuralKeywords = this.extractKeywords(metadata.full_title as string)
+      } else if (metadata.article_title) {
+        structuralKeywords = this.extractKeywords(metadata.article_title as string)
+      }
+      p.chunks.forEach((chunkText, index) => {
+        const sanitizedText = this.sanitizeText(chunkText)
+        const allKeywords = [...new Set([...structuralKeywords, ...this.extractKeywords(sanitizedText)])]
+        points.push({
+          id: randomUUID(),
+          vector: p.vectors![index],
+          payload: {
+            ...metadata,
+            text: sanitizedText,
+            chunk_index: index,
+            total_chunks: p.chunks.length,
+            keywords: allKeywords.join(' '),
+            char_count: sanitizedText.length,
+            created_at: timestamp,
+            source: sanitizedSource,
+            active,
+          },
+        })
+      })
+    }
+
+    for (let i = 0; i < points.length; i += 256) {
+      await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, {
+        wait: true,
+        points: points.slice(i, i + 256),
+      })
+    }
+
+    // Same toggle race closure as embedAndStoreText.
+    for (const [source, active] of activeBySource) {
+      const currentActive = await this._readActiveFlag(source)
+      if (currentActive !== active) {
+        await this.qdrant!.setPayload(RagService.CONTENT_COLLECTION_NAME, {
+          payload: { active: currentActive },
+          points: points.filter((pt) => pt.payload.source === source).map((pt) => pt.id),
+        })
+      }
+    }
+
+    return { chunks: points.length, skippedDocs: skipped.size }
+  }
+
   public async embedAndStoreText(
     text: string,
     metadata: Record<string, any> = {},
@@ -635,11 +839,10 @@ export class RagService {
       `[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata (file totalArticles=${totalArticles})`
     )
 
-    // Process each chunk individually with its metadata
-    let totalChunks = 0
-    for (let i = 0; i < zimChunks.length; i++) {
-      const zimChunk = zimChunks[i]
-      const result = await this.embedAndStoreText(zimChunk.text, {
+    // [fork: batched-embedding] All sections of this batch in one batched call.
+    const docs = zimChunks.map((zimChunk) => ({
+      text: zimChunk.text,
+      metadata: {
         source: filepath,
         content_type: 'zim_article',
         // Without this the ZIM path writes points with no `collection` at all, so
@@ -669,15 +872,12 @@ export class RagService {
 
         // Extraction metadata - not overly relevant for search, but could be useful for debugging and future features...
         extraction_strategy: zimChunk.strategy,
-      })
-
-      if (result) {
-        totalChunks += result.chunks
-      }
-
-      if (onProgress) {
-        await onProgress(((i + 1) / zimChunks.length) * 100)
-      }
+      },
+    }))
+    const embedded = await this.embedAndStoreMany(docs, onProgress)
+    const totalChunks = embedded.chunks
+    if (embedded.skippedDocs > 0) {
+      logger.warn(`[RAG] Skipped ${embedded.skippedDocs} sections whose embedding failed`)
     }
 
     // Gate the continuation on articles the extractor CONSUMED, not on articles that
