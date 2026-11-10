@@ -52,6 +52,16 @@ export default class QueueWork extends BaseCommand {
 
     const workers: Worker[] = []
 
+    // [fork: auto-resume] Must run before the embed worker exists, see
+    // EmbedFileJob.releaseOrphanedLocks.
+    if (queuesToProcess.includes(EmbedFileJob.queue) && EmbedFileJob.autoResumeEnabled) {
+      try {
+        await EmbedFileJob.releaseOrphanedLocks()
+      } catch (err: any) {
+        this.logger.error(`[${EmbedFileJob.queue}] Failed to release orphaned locks: ${err.message}`)
+      }
+    }
+
     // Create a worker for each queue
     for (const queueName of queuesToProcess) {
       const stall = this.getStallOptionsForQueue(queueName)
@@ -139,6 +149,19 @@ export default class QueueWork extends BaseCommand {
       worker.on('completed', (job) => {
         this.logger.info(`[${queueName}] Job completed: ${job.id}`)
       })
+
+      // [fork: auto-resume] A stalled embed batch (maxStalledCount 0, so it is
+      // failed immediately) ends its ZIM chain; continue it from that offset.
+      if (queueName === EmbedFileJob.queue && EmbedFileJob.autoResumeEnabled) {
+        worker.on('stalled', (jobId) => {
+          this.logger.info(`[${queueName}] Job stalled: ${jobId}, scheduling auto-resume`)
+          setTimeout(() => void EmbedFileJob.autoResumeStalled(), 5_000)
+        })
+        // Covers stalls detected by a previous worker process and jobs whose
+        // orphaned lock was released above: BullMQ's stall check needs up to
+        // two 30 s intervals to fail those.
+        setTimeout(() => void EmbedFileJob.autoResumeStalled(), 90_000)
+      }
 
       workers.push(worker)
       this.logger.info(`Worker started for queue: ${queueName}`)

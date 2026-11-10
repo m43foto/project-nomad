@@ -27,6 +27,10 @@ export interface EmbedFileJobParams {
   // [fork: zim-entry-cursor] Raw entry index where this batch starts, so the
   // extractor can seek instead of re-walking the archive from entry 0.
   entryCursor?: number
+  // [fork: auto-resume] Offset at which this chain was last resumed and how
+  // often in a row, so a batch that hangs every time isn't auto-resumed forever.
+  resumedAtOffset?: number
+  resumeCount?: number
 }
 
 export class EmbedFileJob {
@@ -569,9 +573,12 @@ export class EmbedFileJob {
   /** Continue a broken ZIM ingestion chain from its last failed batch. The
    *  candidate is re-derived server-side from the file path, so a stale UI can
    *  never resume an outdated batch (and wipe newer vectors). */
-  static async resumeJob(filePath: string): Promise<
+  static async resumeJob(
+    filePath: string,
+    opts: { auto?: boolean } = {}
+  ): Promise<
     | { ok: true; message: string; batchOffset: number; removedPoints: number }
-    | { ok: false; code: 'not_found'; message: string }
+    | { ok: false; code: 'not_found' | 'loop_guard'; message: string }
   > {
     const candidates = await this.findResumeCandidates()
     const job = candidates.get(filePath)
@@ -584,6 +591,14 @@ export class EmbedFileJob {
     }
     const data = job.data as EmbedFileJobParams
     const batchOffset = data.batchOffset ?? 0
+    const resumeCount = data.resumedAtOffset === batchOffset ? (data.resumeCount ?? 0) + 1 : 1
+    if (opts.auto && resumeCount > EmbedFileJob.AUTO_RESUME_MAX_PER_OFFSET) {
+      return {
+        ok: false,
+        code: 'loop_guard',
+        message: `Batch at offset ${batchOffset} already failed after ${EmbedFileJob.AUTO_RESUME_MAX_PER_OFFSET} automatic resumes; resume manually.`,
+      }
+    }
     // job.timestamp (creation) is the safe lower bound: the previous batch had
     // written all of its points before dispatching this one. processedOn is NOT
     // safe — BullMQ rewrites it when it detects the stall after a restart.
@@ -603,6 +618,8 @@ export class EmbedFileJob {
         totalArticles: data.totalArticles,
         isFinalBatch: false,
         chunksSoFar: data.chunksSoFar ?? 0,
+        resumedAtOffset: batchOffset,
+        resumeCount,
         ...(typeof data.entryCursor === 'number' ? { entryCursor: data.entryCursor } : {}),
         ...(effectiveCollection ? { collection: effectiveCollection } : {}),
       },
@@ -624,7 +641,7 @@ export class EmbedFileJob {
     }
 
     logger.info(
-      `[EmbedFileJob] Resumed ${data.fileName} at offset ${batchOffset} (removed ${removedPoints} partial points)`
+      `[EmbedFileJob] ${opts.auto ? 'Auto-resumed' : 'Resumed'} ${data.fileName} at offset ${batchOffset} (removed ${removedPoints} partial points)`
     )
     return {
       ok: true,
@@ -634,14 +651,71 @@ export class EmbedFileJob {
     }
   }
 
-  static async resumeAllJobs(): Promise<{ resumed: number; files: string[] }> {
+  static async resumeAllJobs(
+    opts: { auto?: boolean; onlyStalled?: boolean } = {}
+  ): Promise<{ resumed: number; files: string[] }> {
     const candidates = await this.findResumeCandidates()
     const files: string[] = []
-    for (const filePath of candidates.keys()) {
-      const r = await this.resumeJob(filePath)
+    for (const [filePath, job] of candidates) {
+      // Automatic resume only touches interruptions (stall = worker died / host
+      // slept / container restarted), never genuine processing errors.
+      if (opts.onlyStalled && !(job.failedReason ?? '').includes('stalled')) continue
+      const r = await this.resumeJob(filePath, { auto: opts.auto })
       if (r.ok) files.push(filePath)
+      else logger.warn(`[EmbedFileJob] Not resuming ${filePath}: ${r.message}`)
     }
     return { resumed: files.length, files }
+  }
+
+  // ---------------------------------------------------------------------------
+  // [fork: auto-resume] Continue interrupted ZIM chains without user action.
+  // Disable with NOMAD_AUTO_RESUME_INDEXING=false.
+  // ---------------------------------------------------------------------------
+  static readonly AUTO_RESUME_MAX_PER_OFFSET = 3
+  private static autoResumeRunning = false
+
+  static get autoResumeEnabled(): boolean {
+    return (process.env.NOMAD_AUTO_RESUME_INDEXING ?? 'true').toLowerCase() !== 'false'
+  }
+
+  /** Resume every chain that was interrupted by a stall. Serialized so the
+   *  boot timer and stall events can't dispatch the same continuation twice. */
+  static async autoResumeStalled(): Promise<void> {
+    if (!this.autoResumeEnabled || this.autoResumeRunning) return
+    this.autoResumeRunning = true
+    try {
+      const { resumed, files } = await this.resumeAllJobs({ auto: true, onlyStalled: true })
+      if (resumed > 0) {
+        logger.info(`[EmbedFileJob] Auto-resumed ${resumed} interrupted indexing job(s): ${files.join(', ')}`)
+      }
+    } catch (err) {
+      logger.error(
+        `[EmbedFileJob] Auto-resume failed: ${err instanceof Error ? err.message : String(err)}`
+      )
+    } finally {
+      this.autoResumeRunning = false
+    }
+  }
+
+  /** Called by the queue worker process BEFORE its embed worker starts. Any
+   *  job still 'active' at that moment belongs to a worker that no longer exists
+   *  (this is the only worker process), but its lock lives on for up to
+   *  LONG_LOCK_DURATION (30 min), hiding the interruption for that long.
+   *  Dropping those locks lets BullMQ's stall check fail the job within ~1 min,
+   *  after which autoResumeStalled() picks it up. */
+  static async releaseOrphanedLocks(): Promise<number> {
+    const queue = QueueService.getInstance().getQueue(this.queue)
+    const active = await queue.getJobs(['active'])
+    if (active.length === 0) return 0
+    const client = await queue.client
+    let released = 0
+    for (const job of active) {
+      released += await client.del(`${queue.toKey(job.id!)}:lock`)
+    }
+    logger.info(
+      `[EmbedFileJob] Released ${released} orphaned lock(s) of ${active.length} interrupted job(s)`
+    )
+    return released
   }
 
   static async cleanupFailedJobs(): Promise<{ cleaned: number; filesDeleted: number }> {
