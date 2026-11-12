@@ -186,6 +186,14 @@ export class RagService {
         field_name: 'active',
         field_schema: 'bool',
       })
+      // [fork: resume-indexing] deletePointsForSourceSince() range-filters on
+      // created_at. Unindexed, that count scans every payload of the source
+      // (millions of points for a Wikipedia ZIM) and hits Qdrant's 60 s read
+      // timeout while holding segment locks, so resume never gets past it.
+      await this.qdrant!.createPayloadIndex(collectionName, {
+        field_name: 'created_at',
+        field_schema: { type: 'integer', lookup: false, range: true },
+      })
 
       // Backfill: stamp `active: true` on any point that predates this field.
       // `is_empty` (not a match-all filter) means this only ever touches points
